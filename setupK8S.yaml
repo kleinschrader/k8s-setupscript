@@ -1,0 +1,156 @@
+---
+- hosts: localhost
+  gather_facts: yes
+  tasks:
+  - name: Add SSH Key to Known hosts
+    command:
+      cmd: "bash -c \"ssh-keyscan {{ hostvars[item]['ansible_host'] }} -t | grep ecdsa-sha2-nistp256 >> ~/.ssh/known_hosts\""
+    with_items: "{{ hostvars }}"
+- name: Rename Servers
+  hosts: all
+  become: yes
+  tasks:
+  - name: Apply Hostname
+    hostname:
+      name: "{{ inventory_hostname }}"
+  - name: Add IP address of all hosts to all hosts
+    lineinfile:
+      dest: /etc/hosts
+      regexp: '.*{{ item }}$'
+      line: "{{ hostvars[item].ansible_host }} {{item}}"
+      state: present
+    when: hostvars[item].ansible_host is defined
+    with_items: "{{ groups.all }} "
+- name:  Init Master
+  hosts: k8smaster
+  become: yes
+  tasks:
+  - name: Populate service facts
+    service_facts:
+  - name: Init the cluster
+    command:
+      cmd: "kubeadm init --pod-network-cidr=10.244.0.0/16"
+    when: ansible_facts.services['kubelet.service']['state'] != 'running'
+  - name:  Get kubeadm join command
+    command:
+      cmd: kubeadm token create --print-join-command
+    register: join_command
+  - name: Copy kubeconfig from remote mashines
+    fetch:
+      src: /etc/kubernetes/admin.conf
+      dest: admin.conf
+      flat: yes
+- name: Join all nodes to cluster
+  hosts: k8snodes
+  become: yes
+  tasks:
+  - name: Populate service facts
+    service_facts:
+  - name: Join to cluster
+    command:
+     cmd: "{{ hostvars[groups['k8smaster'][0]]['join_command']['stdout'] }}"
+    when: ansible_facts.services['kubelet.service']['state'] != 'running'
+- name: Create Networking layer
+  hosts: localhost
+  become: no
+  tasks:
+  - name: Apply fannel
+    command:
+      cmd: "kubectl --kubeconfig=admin.conf apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml"
+- hosts: cephnodes[0]
+  become: yes
+  tasks:
+  - name: Check if cephadm exists
+    stat:
+      path: /tmp/cephadm
+    register: cephadm_res
+  - name: Download Cephadm
+    get_url:
+      url: https://github.com/ceph/ceph/raw/octopus/src/cephadm/cephadm
+      dest: /tmp/cephadm
+      mode: '0774'
+    when: not cephadm_res.stat.exists
+  - name: Check if cephadm is already installed
+    stat:
+      path: /usr/sbin/cephadm
+    register: cephadm_inst
+  - name: Add octopus repo and install cephadm
+    command:
+      cmd: "bash -c \"/tmp/cephadm add-repo --release octopus && /tmp/cephadm install\""
+    when: not cephadm_inst.stat.exists
+  - name: Check if ceph common is installed
+    stat:
+      path: /usr/bin/ceph
+    register: ceph_res
+  - name: Install Ceph common
+    command:
+      cmd: "bash -c \"cephadm add-repo --release octopus && cephadm install ceph-common\""
+    when: not ceph_res.stat.exists
+  - name: Check if ceph is configured
+    stat:
+      path: /etc/ceph/ceph.conf
+    register: ceph_conf
+  - name: Bootstrap server
+    command:
+      cmd: "cephadm bootstrap --mon-ip {{  hostvars[inventory_hostname]['ansible_host'] }}"
+    when: not ceph_conf.stat.exists
+  - name: Register Key
+    command:
+      cmd: "cat /etc/ceph/ceph.pub"
+    register: keyreadout
+- hosts: cephnodes,!cephnodes[0]
+  become: yes
+  tasks:
+  - name: Install autherised key
+    command:
+      cmd: "bash -c \" echo '{{ hostvars[ groups['cephnodes'][0] ]['keyreadout']['stdout'] }}' >> /root/.ssh/authorized_keys \""
+- hosts: cephnodes[0]
+  become: yes
+  tasks:
+  - name: Add Other Nodes to orchestra
+    command:
+      cmd: "ceph orch host add {{ item }}"
+    with_items: "{{ groups['cephnodes'][1:] }}"
+  - name: Add vhd
+    command:
+      cmd: "ceph orch daemon add osd {{ item }}:/dev/vdb"
+    with_items: "{{ groups['cephnodes'] }}"
+  - name: Check k8s pool
+    command:
+      cmd: "ceph osd pool stats kubernetes"
+    register: pool_stats
+    ignore_errors: yes  
+  - name: Create K8s pool
+    command:
+      cmd: "ceph osd pool create kubernetes"
+    when: pool_stats['rc'] != 0
+  - name: Init K8s pool
+    command:
+      cmd: "rbd pool init kubernetes"
+    when: pool_stats['rc'] != 0
+  - name: Create k8s user
+    shell: ceph auth get-or-create client.kubernetes mon 'profile rbd' osd 'profile rbd pool=kubernetes' mgr 'profile rbd pool=kubernetes' | grep -oP '(?<=key \= ).+$'
+    register: auth_out
+  - name: Source Cluster ID
+    shell: 'ceph mon dump | grep -oP "(?<=fsid ).+$"'
+    register: cluster_id
+  - name: Source Monitor IP's
+    shell: 'ceph mon dump | grep -oP "(?<=v1:)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:6789"'
+    register: monitor_ip
+- hosts: localhost
+  become: yes
+  tasks:
+  - name: Fill out ceph template
+    shell:
+      cmd: "envsubst < ceph-template.yaml > /tmp/ceph.yaml" 
+      chdir: "{{ playbook_dir }}"
+    environment:
+      CLUSTER_ID: "{{ hostvars[groups['cephnodes'][0]]['cluster_id']['stdout_lines'][0] }}"
+      MONITOR_1: "{{ hostvars[groups['cephnodes'][0]]['monitor_ip']['stdout_lines'][0] }}"
+      MONITOR_2: "{{ hostvars[groups['cephnodes'][0]]['monitor_ip']['stdout_lines'][1] }}"
+      MONITOR_3: "{{ hostvars[groups['cephnodes'][0]]['monitor_ip']['stdout_lines'][2] }}"
+      USER_SECRET: "{{ hostvars[groups['cephnodes'][0]]['auth_out']['stdout_lines'][0] }}"
+  - name: Apply Ceph
+    command:
+      cmd: "kubectl --kubeconfig=admin.conf apply -f /tmp/ceph.yaml"
+      chdir: "{{ playbook_dir }}"

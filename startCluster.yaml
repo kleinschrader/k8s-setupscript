@@ -1,0 +1,14 @@
+---
+- hosts: localhost
+  name: Start VMS
+  become: yes
+  tasks:
+  - name: Start Network Auto
+    command:
+      cmd: "virsh net-start auto"
+    ignore_errors: yes
+  - name: Start vms
+    command:
+      cmd: "bash -c \"virsh start {{ hostvars[item]['inventory_hostname'] }} \""
+    with_items: "{{ hostvars }}"
+    ignore_errors: yes

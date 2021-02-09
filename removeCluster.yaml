@@ -1,0 +1,14 @@
+---
+- hosts: localhost
+  name: Remove VMS
+  become: yes
+  tasks:
+  - name: Kill vms
+    command:
+      cmd: "bash -c \"virsh destroy {{ hostvars[item]['inventory_hostname'] }} \""
+    with_items: "{{ hostvars }}"
+    ignore_errors: yes
+  - name: Undefine vms
+    command:
+      cmd: "bash -c \"virsh undefine {{ hostvars[item]['inventory_hostname'] }} \""
+    with_items: "{{ hostvars }}"
